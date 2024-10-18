@@ -14,17 +14,26 @@
 // Ra-02 pinout
 #define SS 15
 #define RST 16
-#define DIO0 2
 
 // OLED pinout
 #define OLED_SDA 4  // GPIO4 (D2)
 #define OLED_SCL 5  // GPIO5 (D1)
 
+// Rotary Encoder pinout
+#define CLK 0
+#define DT 2
+
 
 // Create an SSD1306 display object connected to I2C (SDA, SCL)
 Adafruit_SSD1306 OLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 String data = "bismillah!";
-int beacon_count = 0;
+
+// Rotary encoder data init
+int counter = 0;
+int currentStateCLK;
+int lastStateCLK;
+String currentDir ="";
+unsigned long lastButtonPress = 0;
 
 
 bool initilialize_OLED(){
@@ -68,27 +77,54 @@ void setup(){
   pinMode(LED_BUILTIN, OUTPUT);
 
   // Initialize LoRa
-  LoRa.setPins(SS, RST, DIO0);
+  LoRa.setPins(SS, RST, -1);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa Error");
     delay(100);
     while (1);
   }
+
+  // Rotrary encoder
+	pinMode(CLK,INPUT);
+	pinMode(DT,INPUT);
+  lastStateCLK = digitalRead(CLK);
 }
 
+
 void loop(){
-  digitalWrite(LED_BUILTIN, LOW);
-  Serial.print("Sending Data: ");
-  Serial.println(data);
+  // Read the current state of CLK
+	currentStateCLK = digitalRead(CLK);
 
-  LoRa.beginPacket();
-  LoRa.print(data + " " + String(beacon_count));
-  LoRa.endPacket();
+  if (currentStateCLK != lastStateCLK){
 
-  print_OLED(data + " " + String(beacon_count), 0, 40);
+		// If the DT state is different than the CLK state then
+		// the encoder is rotating CCW so decrement
+		if (digitalRead(DT) != currentStateCLK) {
+			counter --;
+			currentDir ="CCW";
+		} else {
+			// Encoder is rotating CW so increment
+			counter ++;
+			currentDir ="CW";
+		}
 
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(1000);
+    Serial.print("Sending Data: ");
+    Serial.println(data);
+    LoRa.beginPacket();
+    LoRa.print(data + " " + String(counter));
+    LoRa.endPacket();
+    print_OLED(data + " " + String(counter), 0, 40);
 
-  beacon_count++;
+		Serial.print("Direction: ");
+		Serial.print(currentDir);
+		Serial.print(" | Counter: ");
+		Serial.println(counter);
+	}
+
+	// Remember last CLK state
+	lastStateCLK = currentStateCLK;
+
+	// Put in a slight delay to help debounce the reading
+	delay(1);
+
 }
