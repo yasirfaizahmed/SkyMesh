@@ -1,3 +1,6 @@
+#include <vector>
+#include <variant>
+
 #include <LoRa.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -23,6 +26,20 @@
 #define CLK 0
 #define DT 2
 
+// Modes
+#define BEACON "BEACON"
+#define TEXT "TEXT"
+#define SENT "SENT"
+#define INBOX "INBOX"
+
+// Alphanumeric
+std::vector<String> alphanum = {
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
+        "u", "v", "w", "x", "y", "z",
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+};
+
 
 // Create an SSD1306 display object connected to I2C (SDA, SCL)
 Adafruit_SSD1306 OLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -32,8 +49,14 @@ String data = "bismillah!";
 int counter = 0;
 int currentStateCLK;
 int lastStateCLK;
-String currentDir ="";
+String currentDir = "";
 unsigned long lastButtonPress = 0;
+
+// current mode
+String current_mode = TEXT;
+int16_t alphanum_index = 0;
+std::variant<String, char> selected_object = alphanum[alphanum_index];
+
 
 
 bool initilialize_OLED(){
@@ -81,12 +104,23 @@ void powerOnAnimation() {
 }
 
 
-void print_OLED(String message, int16_t x ,int16_t y, int16_t font_size=1){
+void print_OLED(String message, int16_t x ,int16_t y, int16_t font_size=1, bool clear=true){
   OLED.setTextSize(font_size);
-  OLED.clearDisplay();
+  if (clear == true) OLED.clearDisplay();
   OLED.setCursor(x, y);
   OLED.println(message);
   OLED.display();
+}
+
+
+bool set_mode(String mode){
+  uint16_t width, height;
+  int16_t x1, y1;
+  OLED.setTextSize(1);
+  OLED.getTextBounds(mode, 0, 0, &x1, &y1, &width, &height);
+  print_OLED(mode, (SCREEN_WIDTH)/2 - (width/2), 0, 1, false);
+
+  return true;
 }
 
 
@@ -94,23 +128,18 @@ void setup(){
   // Initialize serial
   Serial.begin(9600);
   while (!Serial);
-  Serial.println("Sender Host");
 
   // Initialize OLED
   if(initilialize_OLED() == false){
     Serial.println("OLED initialization failed");
   }
-  print_OLED(":)", 0, 50);
-
-  // Onboard LED
-  pinMode(LED_BUILTIN, OUTPUT);
 
   // Initialize LoRa
   LoRa.setPins(SS, RST, -1);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa Error");
     delay(100);
-    while (1);
+    for (;;);
   }
 
   // Rotrary encoder
@@ -120,12 +149,20 @@ void setup(){
 
   // Run the animation
   powerOnAnimation();
+
+  // Go to default mode "BEACON"
+  current_mode = BEACON;
+  // show_alphanumeric_scrollable_keyboard();
+  print_OLED(alphanum[alphanum_index], SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 1);
+  set_mode(current_mode);
+
 }
 
 
 void loop(){
   // handle if any message recievied
   if (LoRa.parsePacket()) {
+    // TODO:store the recieved message in permanent memory
     Serial.print("Receiving Data: ");
     while (LoRa.available()) {
       String data = LoRa.readString();
@@ -136,7 +173,6 @@ void loop(){
 
   // Read the current state of CLK
 	currentStateCLK = digitalRead(CLK);
-
   if (currentStateCLK != lastStateCLK){
 
 		// If the DT state is different than the CLK state then
@@ -144,25 +180,29 @@ void loop(){
 		if (digitalRead(DT) != currentStateCLK) {
 			counter --;
 			currentDir ="CCW";
+      alphanum_index--;
 		} else {
 			// Encoder is rotating CW so increment
 			counter ++;
 			currentDir ="CW";
+      alphanum_index++;
 		}
 
-    Serial.print("Sending Data: ");
-    Serial.println(data);
-    LoRa.beginPacket();
-    LoRa.print(data + " " + String(counter));
-    LoRa.endPacket();
-    print_OLED("tx:" + data + " " + String(counter), 0, 40);
+    print_OLED(alphanum[alphanum_index], SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 1);
+    set_mode(current_mode);
 
-		Serial.print("Direction: ");
-		Serial.print(currentDir);
-		Serial.print(" | Counter: ");
-		Serial.println(counter);
+    // Serial.print("Sending Data: ");
+    // Serial.println(data);
+    // LoRa.beginPacket();
+    // LoRa.print(data + " " + String(counter));
+    // LoRa.endPacket();
+    // print_OLED("tx:" + data + " " + String(counter), 0, 40);
+
+		// Serial.print("Direction: ");
+		// Serial.print(currentDir);
+		// Serial.print(" | Counter: ");
+		// Serial.println(counter);
 	}
-
 	// Remember last CLK state
 	lastStateCLK = currentStateCLK;
 
