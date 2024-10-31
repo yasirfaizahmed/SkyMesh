@@ -31,8 +31,9 @@
 #define SENT "SENT"
 #define INBOX "INBOX"
 
-// Buttons
-String BUTTONS[] = {"texting", "send", "clear"};
+// Menu
+String menu[] = {"Delete", "Clear", "Save", "SEND"};
+int menu_size = sizeof(menu) / sizeof(menu[0]); 
 
 // OLED cordinates
 #define alphanum_y_cor 18
@@ -43,7 +44,7 @@ std::vector<String> alphanum = {
         " ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
         "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
         "u", "v", "w", "x", "y", "z",
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "Send", "Clear"
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
 };
 int alphanum_size = alphanum.size();
 
@@ -55,11 +56,15 @@ String payload = "";
 int currentStateCLK;
 int lastStateCLK;
 int debounceState = 1;
+unsigned long lastPressTime = 0;
+const int doubleClickThreshold = 300;  // 300ms threshold for double-click
+bool waitingForDoubleClick = false;
+bool doubleClickDetected = false;
 
 // current option
-String current_option = BEACON;
-int button_index = 0;
-String current_button = BUTTONS[button_index];
+String current_mode = BEACON;
+int menu_index = 0;
+String current_option = menu[menu_index];
 int16_t alphanum_index = 0;
 std::variant<String, char> selected_object = alphanum[alphanum_index];
 
@@ -130,21 +135,27 @@ void add_OLED(String message,
 }
 
 
-void updateOLED(){
+void updateOLED(bool menu_mode=false){
   uint16_t width, height;
   bool draw_rect = false;
-
   // clear
   OLED.clearDisplay();
 
-  // mode
-  add_OLED(current_option, 5, 2, &width, &height, 1, false, false, false);
-  // current character
-  if (current_button == BUTTONS[0]) draw_rect = true;
-  else draw_rect = false;
-  add_OLED(alphanum[alphanum_index], alphanum_x_cor, alphanum_y_cor, &width, &height, 1, false, false, draw_rect);
-  // payload
-  add_OLED(payload, alphanum_x_cor + 35, alphanum_y_cor, &width, &height, 1, false, false, false);
+  if (menu_mode == false){
+    // mode
+    add_OLED(current_mode, 5, 2, &width, &height, 1, false, false, false);
+    // current character
+    add_OLED(alphanum[alphanum_index], alphanum_x_cor, alphanum_y_cor, &width, &height, 1, false, false, true);
+    // payload
+    add_OLED(payload, alphanum_x_cor + 35, alphanum_y_cor, &width, &height, 1, false, false, false);
+  }
+  else{
+    for (int i=0;i<menu_size;i++){
+      if (i == menu_index) draw_rect = true;
+      add_OLED(menu[i], 0, 20 + i*10, &width, &height, 1, true, false, draw_rect);
+      draw_rect = false;
+    }
+  }
 
   //display
   OLED.display();
@@ -176,11 +187,50 @@ void setup(){
   lastStateCLK = digitalRead(CLK);
 
   // Run the animation
-  // powerOnAnimation();
+  powerOnAnimation();
 
   // Go to default mode "BEACON"
-  current_option = BEACON;
-  updateOLED();
+  current_mode = BEACON;
+  updateOLED(false);
+}
+
+
+void menu_loop(){
+  updateOLED(true);
+  while(1){
+    // Read the current state of CLK
+    currentStateCLK = digitalRead(CLK);
+    if (currentStateCLK != lastStateCLK){
+
+      // If the DT state is different than the CLK state then
+      // the encoder is rotating CCW so decrement
+      if (digitalRead(DT) != currentStateCLK) {
+        if (--menu_index < 0) menu_index = menu_size - 1;
+      } else {
+        if (++menu_index > menu_size - 1 ) menu_index = 0;
+      }
+
+      // update OLED
+      updateOLED(true);
+    }
+    // Remember last CLK state
+    lastStateCLK = currentStateCLK;
+
+    // deBouncer
+    if (digitalRead(SW) == 0 && debounceState == 1){
+      debounceState = 0;
+
+      Serial.println("menu");
+      updateOLED(true);
+      break;
+    }
+    
+
+    // Reset debounce state when button is released
+    if (digitalRead(SW) == 1) debounceState = 1;
+
+    delay(1);
+  }
 }
 
 
@@ -209,7 +259,7 @@ void loop(){
 		}
 
     // update OLED
-    updateOLED();
+    updateOLED(false);
 	}
 	// Remember last CLK state
 	lastStateCLK = currentStateCLK;
@@ -217,20 +267,33 @@ void loop(){
   // deBouncer
   if (digitalRead(SW) == 0 && debounceState == 1){
     debounceState = 0;
+    unsigned long currentTime = millis();
 
-    if (alphanum[alphanum_index] == "Clear"){
-      payload = "";
+    if (waitingForDoubleClick && (currentTime - lastPressTime <= doubleClickThreshold)) {
+      // Double-click detected
+      doubleClickDetected = true;
+      waitingForDoubleClick = false;
+      Serial.println("Double-click detected");
+      menu_loop();
+    } else {
+      // First click or single click
+      doubleClickDetected = false;
+      waitingForDoubleClick = true;
+      lastPressTime = currentTime;
     }
-    else if (alphanum[alphanum_index] == "Send"){
-      Serial.println("Sending payload");
-    }
-    else if (alphanum[alphanum_index] != "Text") payload += alphanum[alphanum_index];
 
-    updateOLED();
+    payload += alphanum[alphanum_index];
+    updateOLED(false);
   }
+  
+  // Reset debounce state when button is released
   if (digitalRead(SW) == 1) debounceState = 1;
+
+  // Timeout for double-click detection
+  if (waitingForDoubleClick && (millis() - lastPressTime > doubleClickThreshold)) {
+    waitingForDoubleClick = false;
+    }
 
 	// Put in a slight delay to help debounce the reading
 	delay(1);
-
 }
