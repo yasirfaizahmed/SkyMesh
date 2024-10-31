@@ -1,4 +1,4 @@
-#include <vector>
+ #include <vector>
 #include <variant>
 
 #include <LoRa.h>
@@ -16,7 +16,6 @@
 
 // Ra-02 pinout
 #define SS 15
-#define RST 16
 
 // OLED pinout
 #define OLED_SDA 4  // GPIO4 (D2)
@@ -25,38 +24,45 @@
 // Rotary Encoder pinout
 #define CLK 0
 #define DT 2
+#define SW 16
 
-// Modes
+// Option
 #define BEACON "BEACON"
-#define TEXT "TEXT"
 #define SENT "SENT"
 #define INBOX "INBOX"
 
+// Buttons
+#define TEXTING "Texting"
+#define SEND "Send"
+#define CANCEL "Cancel"
+
+// OLED cordinates
+#define alphanum_y_cor 18
+#define alphanum_x_cor 5
+
 // Alphanumeric
 std::vector<String> alphanum = {
-        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        "Mode", " ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
         "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
         "u", "v", "w", "x", "y", "z",
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
 };
-
+int alphanum_size = alphanum.size();
 
 // Create an SSD1306 display object connected to I2C (SDA, SCL)
 Adafruit_SSD1306 OLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-String data = "bismillah!";
+String payload = "";
 
 // Rotary encoder data init
-int counter = 0;
 int currentStateCLK;
 int lastStateCLK;
-String currentDir = "";
-unsigned long lastButtonPress = 0;
+int debounceState = 1;
 
-// current mode
-String current_mode = TEXT;
+// current option
+String current_option = BEACON;
+String current_button = TEXTING;
 int16_t alphanum_index = 0;
 std::variant<String, char> selected_object = alphanum[alphanum_index];
-
 
 
 bool initilialize_OLED(){
@@ -104,23 +110,48 @@ void powerOnAnimation() {
 }
 
 
-void print_OLED(String message, int16_t x ,int16_t y, int16_t font_size=1, bool clear=true){
+void add_OLED(String message,
+                int16_t x,
+                int16_t y,
+                uint16_t* width_ptr,
+                uint16_t* height_ptr,
+                int16_t font_size=1,
+                // bool clear=true,
+                bool center_x=false,
+                bool center_y=false,
+                bool draw_rect=false){
+  uint16_t width, height;
+  int16_t x1, y1;
   OLED.setTextSize(font_size);
-  if (clear == true) OLED.clearDisplay();
+  OLED.getTextBounds(message, 0, 0, &x1, &y1, width_ptr, height_ptr);
+  if (center_x == true) x = (SCREEN_WIDTH/2) - (*width_ptr/2);
+  if (center_y == true) y = (SCREEN_HEIGHT/2) - (*height_ptr/2);
+  if (draw_rect == true) OLED.drawRect(x - 2, y - 2, *width_ptr + 3, *height_ptr + 3, WHITE);
   OLED.setCursor(x, y);
   OLED.println(message);
-  OLED.display();
 }
 
 
-bool set_mode(String mode){
+void updateOLED(){
   uint16_t width, height;
-  int16_t x1, y1;
-  OLED.setTextSize(1);
-  OLED.getTextBounds(mode, 0, 0, &x1, &y1, &width, &height);
-  print_OLED(mode, (SCREEN_WIDTH)/2 - (width/2), 0, 1, false);
+  bool draw_rect = false;
 
-  return true;
+  // clear
+  OLED.clearDisplay();
+
+  // mode
+  add_OLED(current_option, 5, 0, &width, &height, 1, false, false, false);
+  // current character
+  if (current_button == TEXTING) draw_rect = true;
+  add_OLED(alphanum[alphanum_index], alphanum_x_cor, alphanum_y_cor, &width, &height, 1, false, false, draw_rect);
+  // payload
+  add_OLED(payload, alphanum_x_cor + 10, alphanum_y_cor, &width, &height, 1, false, false, false);
+  // send/clear button
+  if (current_button == SEND) draw_rect = true;
+  // add_OLED(SEND, &width, &height, )
+
+  //display
+  OLED.display();
 }
 
 
@@ -135,7 +166,7 @@ void setup(){
   }
 
   // Initialize LoRa
-  LoRa.setPins(SS, RST, -1);
+  LoRa.setPins(SS, -1, -1);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa Error");
     delay(100);
@@ -145,17 +176,15 @@ void setup(){
   // Rotrary encoder
 	pinMode(CLK,INPUT);
 	pinMode(DT,INPUT);
+  pinMode(SW, INPUT);
   lastStateCLK = digitalRead(CLK);
 
   // Run the animation
-  powerOnAnimation();
+  // powerOnAnimation();
 
   // Go to default mode "BEACON"
-  current_mode = BEACON;
-  // show_alphanumeric_scrollable_keyboard();
-  print_OLED(alphanum[alphanum_index], SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 1);
-  set_mode(current_mode);
-
+  current_option = BEACON;
+  updateOLED();
 }
 
 
@@ -167,7 +196,7 @@ void loop(){
     while (LoRa.available()) {
       String data = LoRa.readString();
       Serial.println(data);
-      print_OLED("rx:" + data, 0, 50);
+      // print_OLED("rx:" + data, 0, 50);
     }
   }
 
@@ -178,33 +207,26 @@ void loop(){
 		// If the DT state is different than the CLK state then
 		// the encoder is rotating CCW so decrement
 		if (digitalRead(DT) != currentStateCLK) {
-			counter --;
-			currentDir ="CCW";
-      alphanum_index--;
+      if (--alphanum_index < 0) alphanum_index = alphanum_size - 1;
 		} else {
-			// Encoder is rotating CW so increment
-			counter ++;
-			currentDir ="CW";
-      alphanum_index++;
+      if (++alphanum_index > alphanum_size - 1 ) alphanum_index = 0;
 		}
 
-    print_OLED(alphanum[alphanum_index], SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 1);
-    set_mode(current_mode);
+    // update OLED
+    updateOLED();
+    
 
-    // Serial.print("Sending Data: ");
-    // Serial.println(data);
-    // LoRa.beginPacket();
-    // LoRa.print(data + " " + String(counter));
-    // LoRa.endPacket();
-    // print_OLED("tx:" + data + " " + String(counter), 0, 40);
-
-		// Serial.print("Direction: ");
-		// Serial.print(currentDir);
-		// Serial.print(" | Counter: ");
-		// Serial.println(counter);
 	}
 	// Remember last CLK state
 	lastStateCLK = currentStateCLK;
+
+  // deBouncer
+  if (digitalRead(SW) == 0 && debounceState == 1){
+    debounceState = 0;
+    payload += alphanum[alphanum_index];
+    updateOLED();
+  }
+  if (digitalRead(SW) == 1) debounceState = 1;
 
 	// Put in a slight delay to help debounce the reading
 	delay(1);
