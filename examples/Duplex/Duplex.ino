@@ -32,9 +32,7 @@
 #define INBOX "INBOX"
 
 // Buttons
-#define TEXTING "Texting"
-#define SEND "Send"
-#define CANCEL "Cancel"
+String BUTTONS[] = {"texting", "send", "clear"};
 
 // OLED cordinates
 #define alphanum_y_cor 18
@@ -42,10 +40,10 @@
 
 // Alphanumeric
 std::vector<String> alphanum = {
-        "Mode", " ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+        " ", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
         "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
         "u", "v", "w", "x", "y", "z",
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "Send", "Clear"
 };
 int alphanum_size = alphanum.size();
 
@@ -60,7 +58,8 @@ int debounceState = 1;
 
 // current option
 String current_option = BEACON;
-String current_button = TEXTING;
+int button_index = 0;
+String current_button = BUTTONS[button_index];
 int16_t alphanum_index = 0;
 std::variant<String, char> selected_object = alphanum[alphanum_index];
 
@@ -116,7 +115,6 @@ void add_OLED(String message,
                 uint16_t* width_ptr,
                 uint16_t* height_ptr,
                 int16_t font_size=1,
-                // bool clear=true,
                 bool center_x=false,
                 bool center_y=false,
                 bool draw_rect=false){
@@ -140,15 +138,13 @@ void updateOLED(){
   OLED.clearDisplay();
 
   // mode
-  add_OLED(current_option, 5, 0, &width, &height, 1, false, false, false);
+  add_OLED(current_option, 5, 2, &width, &height, 1, false, false, false);
   // current character
-  if (current_button == TEXTING) draw_rect = true;
+  if (current_button == BUTTONS[0]) draw_rect = true;
+  else draw_rect = false;
   add_OLED(alphanum[alphanum_index], alphanum_x_cor, alphanum_y_cor, &width, &height, 1, false, false, draw_rect);
   // payload
-  add_OLED(payload, alphanum_x_cor + 10, alphanum_y_cor, &width, &height, 1, false, false, false);
-  // send/clear button
-  if (current_button == SEND) draw_rect = true;
-  // add_OLED(SEND, &width, &height, )
+  add_OLED(payload, alphanum_x_cor + 35, alphanum_y_cor, &width, &height, 1, false, false, false);
 
   //display
   OLED.display();
@@ -214,8 +210,6 @@ void loop(){
 
     // update OLED
     updateOLED();
-    
-
 	}
 	// Remember last CLK state
 	lastStateCLK = currentStateCLK;
@@ -223,7 +217,15 @@ void loop(){
   // deBouncer
   if (digitalRead(SW) == 0 && debounceState == 1){
     debounceState = 0;
-    payload += alphanum[alphanum_index];
+
+    if (alphanum[alphanum_index] == "Clear"){
+      payload = "";
+    }
+    else if (alphanum[alphanum_index] == "Send"){
+      Serial.println("Sending payload");
+    }
+    else if (alphanum[alphanum_index] != "Text") payload += alphanum[alphanum_index];
+
     updateOLED();
   }
   if (digitalRead(SW) == 1) debounceState = 1;
