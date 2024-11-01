@@ -135,13 +135,13 @@ void add_OLED(String message,
 }
 
 
-void updateOLED(bool menu_mode=false){
+void updateOLED(String screen="home"){
   uint16_t width, height;
   bool draw_rect = false;
   // clear
   OLED.clearDisplay();
 
-  if (menu_mode == false){
+  if (screen == "home"){
     // mode
     add_OLED(current_mode, 5, 2, &width, &height, 1, false, false, false);
     // current character
@@ -149,7 +149,7 @@ void updateOLED(bool menu_mode=false){
     // payload
     add_OLED(payload, alphanum_x_cor + 35, alphanum_y_cor, &width, &height, 1, false, false, false);
   }
-  else{
+  else if(screen == "menu"){
     for (int i=0;i<menu_size;i++){
       if (i == menu_index) draw_rect = true;
       add_OLED(menu[i], 0, 20 + i*10, &width, &height, 1, true, false, draw_rect);
@@ -159,6 +159,48 @@ void updateOLED(bool menu_mode=false){
 
   //display
   OLED.display();
+}
+
+
+void beacon(String payload, int maxDots, int beaconDelayTime){
+  // updateOLED("beacon");
+  int beaconElapsedTime = 0;
+  int dotCount = 0;
+  while(1){
+    // deBouncer
+    if (digitalRead(SW) == 0 && debounceState == 1){
+      debounceState = 0;
+      
+      updateOLED("home");
+      break;
+    }
+    // Reset debounce state when button is released
+    if (digitalRead(SW) == 1) debounceState = 1;
+
+    // SENDING animation
+    if (beaconElapsedTime >= beaconDelayTime){
+      // transmitting
+      LoRa.beginPacket();
+      LoRa.print(payload);
+      LoRa.endPacket();
+
+      // animating
+      OLED.clearDisplay();
+      OLED.setCursor(10, SCREEN_HEIGHT / 2);
+      OLED.print("Beacon '" + payload + "'");
+      for (int i = 0; i < dotCount; i++) {
+        OLED.print(".");
+      }
+      OLED.display();
+      dotCount = (dotCount + 1) % (maxDots + 1);
+      beaconElapsedTime = 0;
+    }
+    beaconElapsedTime++;
+
+
+
+    delay(1);
+  }
 }
 
 
@@ -191,12 +233,12 @@ void setup(){
 
   // Go to default mode "BEACON"
   current_mode = BEACON;
-  updateOLED(false);
+  updateOLED("home");
 }
 
 
 void menu_loop(){
-  updateOLED(true);
+  updateOLED("menu");
   while(1){
     // Read the current state of CLK
     currentStateCLK = digitalRead(CLK);
@@ -211,7 +253,7 @@ void menu_loop(){
       }
 
       // update OLED
-      updateOLED(true);
+      updateOLED("menu");
     }
     // Remember last CLK state
     lastStateCLK = currentStateCLK;
@@ -220,12 +262,26 @@ void menu_loop(){
     if (digitalRead(SW) == 0 && debounceState == 1){
       debounceState = 0;
 
-      Serial.println("menu");
-      updateOLED(true);
+      if (menu[menu_index] == "Delete"){
+        if (payload != ""){
+          payload.remove(payload.length() - 1);
+        }
+      }
+      else if (menu[menu_index] == "Clear"){
+        payload = "";
+      }
+      else if (menu[menu_index] == "Save"){
+        // TODO
+      }
+      else if (menu[menu_index] == "SEND"){
+        if (current_mode == BEACON){
+          beacon(payload, 3, 2000);
+        }
+      }
+      updateOLED("menu");
       break;
     }
     
-
     // Reset debounce state when button is released
     if (digitalRead(SW) == 1) debounceState = 1;
 
@@ -259,7 +315,7 @@ void loop(){
 		}
 
     // update OLED
-    updateOLED(false);
+    updateOLED("home");
 	}
 	// Remember last CLK state
 	lastStateCLK = currentStateCLK;
@@ -280,10 +336,11 @@ void loop(){
       doubleClickDetected = false;
       waitingForDoubleClick = true;
       lastPressTime = currentTime;
+
     }
 
-    payload += alphanum[alphanum_index];
-    updateOLED(false);
+    // payload += alphanum[alphanum_index];
+    updateOLED("home");
   }
   
   // Reset debounce state when button is released
@@ -292,7 +349,9 @@ void loop(){
   // Timeout for double-click detection
   if (waitingForDoubleClick && (millis() - lastPressTime > doubleClickThreshold)) {
     waitingForDoubleClick = false;
-    }
+    payload += alphanum[alphanum_index];
+    updateOLED("home");
+  }
 
 	// Put in a slight delay to help debounce the reading
 	delay(1);
