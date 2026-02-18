@@ -1,5 +1,6 @@
 #include <LoRa.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -26,8 +27,13 @@
 // Modes
 #define BEACON "BEACON"
 
+// One-to-one node addressing
+const int DEFAULT_MY_NODE_ID = 1;
+const int NODE_ID_MIN = 1;
+const int NODE_ID_MAX = 9;
+
 // Menu
-String menu[] = {"Delete", "Clear", "Save", "SEND"};
+String menu[] = {"Delete", "Clear", "Save", "Saved", "SelfID", "Target", "SEND", "Back"};
 const int menu_size = sizeof(menu) / sizeof(menu[0]);
 
 // Character table
@@ -43,7 +49,10 @@ const int alphanum_size = sizeof(alphanum) / sizeof(alphanum[0]);
 enum UiState {
   UI_HOME,
   UI_MENU,
-  UI_BEACON
+  UI_BEACON,
+  UI_SAVED,
+  UI_TARGET,
+  UI_SELF_ID
 };
 
 Adafruit_SSD1306 OLED(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -53,6 +62,8 @@ String payload = "";
 String current_mode = BEACON;
 int menu_index = 0;
 int16_t alphanum_index = 0;
+int myNodeId = DEFAULT_MY_NODE_ID;
+int targetNodeId = 2;
 UiState uiState = UI_HOME;
 
 // Encoder state
@@ -72,11 +83,39 @@ unsigned long lastBeaconTxMs = 0;
 unsigned long lastBeaconAnimMs = 0;
 int beaconDotCount = 0;
 
+// EEPROM saved message settings
+const uint16_t EEPROM_SIZE = 256;
+const uint8_t EEPROM_MAGIC = 0x42;
+const uint8_t MAX_SAVED_MESSAGES = 5;
+const uint8_t MAX_MESSAGE_LEN = 24;
+const uint8_t SLOT_SIZE = MAX_MESSAGE_LEN + 1;
+
+const int EEPROM_ADDR_MAGIC = 0;
+const int EEPROM_ADDR_COUNT = 1;
+const int EEPROM_ADDR_HEAD = 2;
+const int EEPROM_ADDR_DATA = 3;
+const int EEPROM_ADDR_SELF_ID = EEPROM_ADDR_DATA + (MAX_SAVED_MESSAGES * SLOT_SIZE);
+
+int savedCount = 0;
+int savedHead = -1;
+int savedBrowseIndex = 0; // 0 = latest message
+
 // Status / UX extras
 bool uiDirty = true;
 String toastMessage = "";
 unsigned long toastUntilMs = 0;
 unsigned long rxIndicatorUntilMs = 0;
+
+// RX marquee state
+String lastRxMessage = "";
+int lastRxFrom = 0;
+bool rxScrollActive = false;
+int rxScrollX = 0;
+uint16_t rxTextWidth = 0;
+unsigned long rxNextStepMs = 0;
+unsigned long rxPauseUntilMs = 0;
+const unsigned long rxScrollStepMs = 70;
+const unsigned long rxScrollPauseMs = 700;
 
 
 bool initilialize_OLED() {
@@ -132,6 +171,182 @@ String trimForWidth(const String &text, int maxChars) {
 }
 
 
+String trimHeadForWidth(const String &text, int maxChars) {
+  if ((int)text.length() <= maxChars) return text;
+  return text.substring(0, maxChars - 3) + "...";
+}
+
+
+String getTailWindow(const String &text, int maxChars) {
+  if ((int)text.length() <= maxChars) return text;
+  return text.substring(text.length() - maxChars);
+}
+
+
+int getSlotAddress(int slot) {
+  return EEPROM_ADDR_DATA + (slot * SLOT_SIZE);
+}
+
+
+void loadSavedMetadata() {
+  savedCount = EEPROM.read(EEPROM_ADDR_COUNT);
+  int rawHead = EEPROM.read(EEPROM_ADDR_HEAD);
+
+  if (savedCount < 0 || savedCount > MAX_SAVED_MESSAGES) {
+    savedCount = 0;
+  }
+
+  if (rawHead == 255) {
+    savedHead = -1;
+  } else if (rawHead >= 0 && rawHead < MAX_SAVED_MESSAGES) {
+    savedHead = rawHead;
+  } else {
+    savedHead = -1;
+  }
+
+  if (savedCount == 0) {
+    savedHead = -1;
+  }
+}
+
+
+void sanitizeNodeIds() {
+  if (myNodeId < NODE_ID_MIN || myNodeId > NODE_ID_MAX) {
+    myNodeId = DEFAULT_MY_NODE_ID;
+  }
+
+  if (targetNodeId < NODE_ID_MIN || targetNodeId > NODE_ID_MAX || targetNodeId == myNodeId) {
+    targetNodeId = (myNodeId < NODE_ID_MAX) ? myNodeId + 1 : NODE_ID_MIN;
+    if (targetNodeId == myNodeId) {
+      targetNodeId = (myNodeId == NODE_ID_MIN) ? NODE_ID_MIN + 1 : NODE_ID_MIN;
+    }
+  }
+}
+
+
+void loadMyNodeIdFromEEPROM() {
+  int stored = EEPROM.read(EEPROM_ADDR_SELF_ID);
+  if (stored >= NODE_ID_MIN && stored <= NODE_ID_MAX) {
+    myNodeId = stored;
+  } else {
+    myNodeId = DEFAULT_MY_NODE_ID;
+  }
+  sanitizeNodeIds();
+}
+
+
+void saveMyNodeIdToEEPROM() {
+  EEPROM.write(EEPROM_ADDR_SELF_ID, myNodeId);
+  EEPROM.commit();
+}
+
+
+void clearMessageSlot(int slot) {
+  int addr = getSlotAddress(slot);
+  for (int i = 0; i < SLOT_SIZE; i++) {
+    EEPROM.write(addr + i, 0);
+  }
+}
+
+
+void writeMessageSlot(int slot, const String &message) {
+  int addr = getSlotAddress(slot);
+  String msg = message;
+  if ((int)msg.length() > MAX_MESSAGE_LEN) {
+    msg = msg.substring(0, MAX_MESSAGE_LEN);
+  }
+
+  for (int i = 0; i < SLOT_SIZE; i++) {
+    if (i < (int)msg.length()) {
+      EEPROM.write(addr + i, msg[i]);
+    } else {
+      EEPROM.write(addr + i, 0);
+    }
+  }
+}
+
+
+String readMessageSlot(int slot) {
+  int addr = getSlotAddress(slot);
+  char buf[SLOT_SIZE];
+
+  for (int i = 0; i < SLOT_SIZE; i++) {
+    uint8_t b = EEPROM.read(addr + i);
+    if (b == 0 || b == 0xFF) {
+      buf[i] = '\0';
+      break;
+    }
+
+    buf[i] = (char)b;
+
+    if (i == SLOT_SIZE - 1) {
+      buf[i] = '\0';
+    }
+  }
+
+  return String(buf);
+}
+
+
+void initSavedStorage() {
+  EEPROM.begin(EEPROM_SIZE);
+
+  if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) {
+    EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.write(EEPROM_ADDR_COUNT, 0);
+    EEPROM.write(EEPROM_ADDR_HEAD, 255);
+    EEPROM.write(EEPROM_ADDR_SELF_ID, DEFAULT_MY_NODE_ID);
+
+    for (int i = 0; i < MAX_SAVED_MESSAGES; i++) {
+      clearMessageSlot(i);
+    }
+
+    EEPROM.commit();
+  }
+
+  loadSavedMetadata();
+  loadMyNodeIdFromEEPROM();
+}
+
+
+bool savePayloadToEEPROM() {
+  if (payload.length() == 0) {
+    return false;
+  }
+
+  int newHead = (savedHead + 1 + MAX_SAVED_MESSAGES) % MAX_SAVED_MESSAGES;
+  writeMessageSlot(newHead, payload);
+
+  savedHead = newHead;
+  if (savedCount < MAX_SAVED_MESSAGES) {
+    savedCount++;
+  }
+
+  EEPROM.write(EEPROM_ADDR_COUNT, savedCount);
+  EEPROM.write(EEPROM_ADDR_HEAD, savedHead);
+  EEPROM.commit();
+  return true;
+}
+
+
+int getSlotByDisplayIndex(int displayIndex) {
+  if (savedCount == 0 || displayIndex < 0 || displayIndex >= savedCount || savedHead < 0) {
+    return -1;
+  }
+
+  int slot = savedHead - displayIndex;
+  if (slot < 0) slot += MAX_SAVED_MESSAGES;
+  return slot;
+}
+
+
+String getSavedMessageByIndex(int displayIndex) {
+  int slot = getSlotByDisplayIndex(displayIndex);
+  if (slot < 0) return "";
+  return readMessageSlot(slot);
+}
+
+
 void showToast(const String &msg, unsigned long durationMs = 900) {
   toastMessage = msg;
   toastUntilMs = millis() + durationMs;
@@ -145,8 +360,8 @@ void drawHeader() {
   OLED.setCursor(0, 0);
 
   String rxFlag = (millis() < rxIndicatorUntilMs) ? "RX*" : "RX-";
-  OLED.print(current_mode);
-  OLED.setCursor(82, 0);
+  OLED.print("N" + String(myNodeId) + "->" + String(targetNodeId));
+  OLED.setCursor(86, 0);
   OLED.print(rxFlag);
 
   OLED.drawLine(0, 10, SCREEN_WIDTH - 1, 10, WHITE);
@@ -162,56 +377,138 @@ void drawFooterHints(const String &hint) {
 }
 
 
+void resetRxMarquee(const String &msg, int fromNode) {
+  lastRxMessage = msg;
+  lastRxFrom = fromNode;
+
+  int16_t x1, y1;
+  uint16_t h;
+  OLED.setTextSize(1);
+  OLED.getTextBounds(lastRxMessage, 0, 0, &x1, &y1, &rxTextWidth, &h);
+
+  int marqueeWidth = SCREEN_WIDTH - 24;
+  if ((int)rxTextWidth <= marqueeWidth) {
+    rxScrollActive = false;
+    rxScrollX = 0;
+  } else {
+    rxScrollActive = true;
+    rxScrollX = marqueeWidth;
+    rxNextStepMs = millis() + rxScrollStepMs;
+    rxPauseUntilMs = 0;
+  }
+
+  uiDirty = true;
+}
+
+
+void tickRxMarquee() {
+  if (!rxScrollActive) return;
+
+  unsigned long now = millis();
+  int marqueeWidth = SCREEN_WIDTH - 24;
+
+  if (rxPauseUntilMs != 0) {
+    if (now < rxPauseUntilMs) return;
+    rxPauseUntilMs = 0;
+    rxScrollX = marqueeWidth;
+    rxNextStepMs = now + rxScrollStepMs;
+    uiDirty = true;
+    return;
+  }
+
+  if (now < rxNextStepMs) return;
+
+  rxNextStepMs = now + rxScrollStepMs;
+  rxScrollX -= 1;
+  uiDirty = true;
+
+  if (rxScrollX < -((int)rxTextWidth)) {
+    rxPauseUntilMs = now + rxScrollPauseMs;
+  }
+}
+
+
+void drawRxMarqueeArea() {
+  OLED.setTextSize(1);
+  OLED.setTextColor(WHITE);
+
+  OLED.setCursor(0, 40);
+  if (lastRxFrom > 0) {
+    OLED.print("RX" + String(lastRxFrom) + ":");
+  } else {
+    OLED.print("RX:");
+  }
+
+  if (lastRxMessage.length() == 0) {
+    OLED.setCursor(24, 40);
+    OLED.print("-");
+    return;
+  }
+
+  if (!rxScrollActive) {
+    OLED.setCursor(24, 40);
+    OLED.print(trimForWidth(lastRxMessage, 17));
+  } else {
+    OLED.setCursor(24 + rxScrollX, 40);
+    OLED.print(lastRxMessage);
+  }
+}
+
+
 void drawHomeScreen() {
   drawHeader();
 
-  // Selected char block
+  // Selected char (same size as payload text)
   OLED.setTextSize(1);
-  OLED.setCursor(2, 14);
-  OLED.print("Char");
-  OLED.drawRect(2, 24, 18, 14, WHITE);
-  OLED.setCursor(8, 28);
+  OLED.setCursor(4, 28);
   OLED.print(alphanum[alphanum_index]);
 
-  // Payload block
-  OLED.setCursor(24, 14);
-  OLED.print("Payload");
-  OLED.drawRect(24, 24, 102, 14, WHITE);
-  OLED.setCursor(27, 28);
-  OLED.print(trimForWidth(payload, 16));
+  // Payload text (2 rows, no outline borders)
+  const int perRowChars = 18;
+  const int totalVisibleChars = perRowChars * 2;
+  String visiblePayload = getTailWindow(payload, totalVisibleChars);
 
-  if (millis() < toastUntilMs) {
-    OLED.setCursor(2, 42);
-    OLED.print(trimForWidth(toastMessage, 21));
+  String row1 = "";
+  String row2 = "";
+  if ((int)visiblePayload.length() <= perRowChars) {
+    row1 = visiblePayload;
+  } else {
+    row1 = visiblePayload.substring(0, perRowChars);
+    row2 = visiblePayload.substring(perRowChars);
   }
 
-  drawFooterHints("1C:Add  2C:Menu");
+  OLED.setTextSize(1);
+  OLED.setCursor(18, 22);
+  OLED.print(row1);
+  OLED.setCursor(18, 32);
+  OLED.print(row2);
+
+  // RX message area (marquee when long)
+  drawRxMarqueeArea();
 }
 
 
 void drawMenuScreen() {
   drawHeader();
 
-  OLED.setCursor(0, 14);
-  OLED.print("Menu");
+  int prevIndex = wrapIndex(menu_index - 1, menu_size);
+  int nextIndex = wrapIndex(menu_index + 1, menu_size);
 
-  for (int i = 0; i < menu_size; i++) {
-    int y = 24 + (i * 8);
-    bool selected = (i == menu_index);
+  OLED.setTextSize(1);
+  OLED.setTextColor(WHITE);
+  OLED.setCursor(-8, 31);
+  OLED.print(trimHeadForWidth(menu[prevIndex], 8));
 
-    if (selected) {
-      OLED.fillRect(2, y - 1, 124, 8, WHITE);
-      OLED.setTextColor(BLACK, WHITE);
-    } else {
-      OLED.setTextColor(WHITE, BLACK);
-    }
+  OLED.setCursor(103, 31);
+  OLED.print(trimHeadForWidth(menu[nextIndex], 8));
 
-    OLED.setCursor(6, y);
-    OLED.print(menu[i]);
-  }
-
+  OLED.fillRoundRect(22, 24, 84, 18, 4, WHITE);
+  OLED.drawRoundRect(21, 23, 86, 20, 4, WHITE);
+  OLED.setTextColor(BLACK, WHITE);
+  OLED.setTextSize(2);
+  OLED.setCursor(26, 28);
+  OLED.print(trimHeadForWidth(menu[menu_index], 7));
   OLED.setTextColor(WHITE, BLACK);
-  drawFooterHints("Turn:Nav  Click:OK");
 }
 
 
@@ -219,10 +516,10 @@ void drawBeaconScreen() {
   drawHeader();
 
   OLED.setCursor(0, 16);
-  OLED.print("Sending beacon");
+  OLED.print("Unicast beacon");
 
   OLED.setCursor(0, 28);
-  OLED.print("Msg: ");
+  OLED.print("To " + String(targetNodeId) + ": ");
   OLED.print(trimForWidth(payload, 17));
 
   OLED.setCursor(0, 40);
@@ -230,8 +527,87 @@ void drawBeaconScreen() {
   for (int i = 0; i < beaconDotCount; i++) {
     OLED.print(".");
   }
+}
 
-  drawFooterHints("Click/Dbl:Stop");
+
+void drawTargetScreen() {
+  drawHeader();
+  OLED.setTextColor(WHITE);
+  OLED.setTextSize(1);
+  OLED.setCursor(0, 16);
+  OLED.print("Set Target Node");
+
+  OLED.drawRoundRect(34, 24, 60, 20, 4, WHITE);
+  OLED.setTextSize(2);
+  OLED.setCursor(52, 28);
+  OLED.print(targetNodeId);
+
+  OLED.setTextSize(1);
+  OLED.setCursor(0, 46);
+  OLED.print("This node: ");
+  OLED.print(myNodeId);
+}
+
+
+void drawSelfIdScreen() {
+  drawHeader();
+  OLED.setTextColor(WHITE);
+  OLED.setTextSize(1);
+  OLED.setCursor(0, 16);
+  OLED.print("Set Self Node ID");
+
+  OLED.drawRoundRect(34, 24, 60, 20, 4, WHITE);
+  OLED.setTextSize(2);
+  OLED.setCursor(52, 28);
+  OLED.print(myNodeId);
+
+  OLED.setTextSize(1);
+  OLED.setCursor(0, 46);
+  OLED.print("Target: ");
+  OLED.print(targetNodeId);
+}
+
+
+void drawSavedScreen() {
+  drawHeader();
+  OLED.setCursor(0, 14);
+  OLED.print("Saved Messages");
+
+  if (savedCount == 0) {
+    OLED.setCursor(0, 30);
+    OLED.print("No saved messages");
+    return;
+  }
+
+  int rows = 4;
+  int start = 0;
+
+  if (savedCount > rows) {
+    start = savedBrowseIndex - 1;
+    if (start < 0) start = 0;
+    if (start > savedCount - rows) start = savedCount - rows;
+  }
+
+  int end = start + rows;
+  if (end > savedCount) end = savedCount;
+
+  for (int i = start; i < end; i++) {
+    int y = 24 + ((i - start) * 8);
+    bool selected = (i == savedBrowseIndex);
+    String line = String(i + 1) + ":" + trimForWidth(getSavedMessageByIndex(i), 16);
+
+    if (selected) {
+      OLED.fillRect(0, y - 1, 128, 8, WHITE);
+      OLED.setTextColor(BLACK, WHITE);
+    } else {
+      OLED.setTextColor(WHITE, BLACK);
+    }
+
+    OLED.setCursor(2, y);
+    OLED.print(line);
+  }
+
+  OLED.setTextColor(WHITE, BLACK);
 }
 
 
@@ -246,6 +622,12 @@ void updateOLED() {
     drawMenuScreen();
   } else if (uiState == UI_BEACON) {
     drawBeaconScreen();
+  } else if (uiState == UI_SAVED) {
+    drawSavedScreen();
+  } else if (uiState == UI_TARGET) {
+    drawTargetScreen();
+  } else if (uiState == UI_SELF_ID) {
+    drawSelfIdScreen();
   }
 
   OLED.display();
@@ -259,8 +641,35 @@ void enterState(UiState nextState) {
     lastBeaconTxMs = 0;  // send immediately on first tick
     lastBeaconAnimMs = millis();
     beaconDotCount = 0;
+  } else if (uiState == UI_SAVED) {
+    savedBrowseIndex = 0;
   }
   uiDirty = true;
+}
+
+
+String buildUnicastPacket(const String &message) {
+  return "T:" + String(targetNodeId) + "|F:" + String(myNodeId) + "|M:" + message;
+}
+
+
+bool parseUnicastPacket(const String &packet, int &to, int &from, String &message) {
+  if (!packet.startsWith("T:")) return false;
+
+  int fPos = packet.indexOf("|F:");
+  int mPos = packet.indexOf("|M:");
+  if (fPos < 0 || mPos < 0 || mPos <= fPos) return false;
+
+  String toPart = packet.substring(2, fPos);
+  String fromPart = packet.substring(fPos + 3, mPos);
+  message = packet.substring(mPos + 3);
+
+  to = toPart.toInt();
+  from = fromPart.toInt();
+
+  if (to < NODE_ID_MIN || to > NODE_ID_MAX) return false;
+  if (from < NODE_ID_MIN || from > NODE_ID_MAX) return false;
+  return true;
 }
 
 
@@ -273,11 +682,23 @@ void processReceivedLoRa() {
     data += (char)LoRa.read();
   }
 
+  int toNode = 0;
+  int fromNode = 0;
+  String msg = "";
+  if (!parseUnicastPacket(data, toNode, fromNode, msg)) {
+    return;
+  }
+
+  if (toNode != myNodeId) {
+    return;
+  }
+
   Serial.print("Receiving Data: ");
-  Serial.println(data);
+  Serial.println("from " + String(fromNode) + ": " + msg);
 
   rxIndicatorUntilMs = millis() + 1200;
-  showToast("RX: " + trimForWidth(data, 17), 1200);
+  resetRxMarquee(msg, fromNode);
+  showToast("RX " + String(fromNode) + ": " + trimForWidth(msg, 14), 1200);
 }
 
 
@@ -330,18 +751,36 @@ void executeMenuAction() {
     enterState(UI_HOME);
   }
   else if (selected == "Save") {
-    // Placeholder behavior kept simple for now
-    showToast("Save not set yet");
+    if (savePayloadToEEPROM()) {
+      showToast("Saved message");
+    } else {
+      showToast("Payload empty");
+    }
     enterState(UI_HOME);
+  }
+  else if (selected == "Saved") {
+    enterState(UI_SAVED);
+  }
+  else if (selected == "SelfID") {
+    enterState(UI_SELF_ID);
+  }
+  else if (selected == "Target") {
+    enterState(UI_TARGET);
   }
   else if (selected == "SEND") {
     if (payload.length() == 0) {
       showToast("Payload empty");
       enterState(UI_HOME);
+    } else if (targetNodeId == myNodeId) {
+      showToast("Target cannot be self");
+      enterState(UI_HOME);
     } else {
       enterState(UI_BEACON);
       showToast("Beacon started", 700);
     }
+  }
+  else if (selected == "Back") {
+    enterState(UI_HOME);
   }
 }
 
@@ -355,6 +794,21 @@ void handleSingleClick() {
   } else if (uiState == UI_BEACON) {
     enterState(UI_HOME);
     showToast("Beacon stopped", 700);
+  } else if (uiState == UI_SAVED) {
+    if (savedCount > 0) {
+      payload = getSavedMessageByIndex(savedBrowseIndex);
+      showToast("Loaded saved msg");
+      enterState(UI_HOME);
+    }
+  } else if (uiState == UI_TARGET) {
+    sanitizeNodeIds();
+    showToast("Target: " + String(targetNodeId));
+    enterState(UI_MENU);
+  } else if (uiState == UI_SELF_ID) {
+    sanitizeNodeIds();
+    saveMyNodeIdToEEPROM();
+    showToast("Self ID: " + String(myNodeId));
+    enterState(UI_MENU);
   }
 }
 
@@ -367,6 +821,12 @@ void handleDoubleClick() {
   } else if (uiState == UI_BEACON) {
     enterState(UI_HOME);
     showToast("Beacon stopped", 700);
+  } else if (uiState == UI_SAVED) {
+    enterState(UI_MENU);
+  } else if (uiState == UI_TARGET) {
+    enterState(UI_MENU);
+  } else if (uiState == UI_SELF_ID) {
+    enterState(UI_MENU);
   }
 }
 
@@ -380,6 +840,25 @@ void handleEncoderRotate(int direction) {
   }
   else if (uiState == UI_MENU) {
     menu_index = wrapIndex(menu_index + direction, menu_size);
+    uiDirty = true;
+  }
+  else if (uiState == UI_SAVED) {
+    if (savedCount > 0) {
+      savedBrowseIndex = wrapIndex(savedBrowseIndex + direction, savedCount);
+      uiDirty = true;
+    }
+  }
+  else if (uiState == UI_TARGET) {
+    targetNodeId += direction;
+    if (targetNodeId < NODE_ID_MIN) targetNodeId = NODE_ID_MAX;
+    if (targetNodeId > NODE_ID_MAX) targetNodeId = NODE_ID_MIN;
+    uiDirty = true;
+  }
+  else if (uiState == UI_SELF_ID) {
+    myNodeId += direction;
+    if (myNodeId < NODE_ID_MIN) myNodeId = NODE_ID_MAX;
+    if (myNodeId > NODE_ID_MAX) myNodeId = NODE_ID_MIN;
+    sanitizeNodeIds();
     uiDirty = true;
   }
 }
@@ -410,11 +889,14 @@ void runBeaconTick() {
   unsigned long now = millis();
 
   if (lastBeaconTxMs == 0 || (now - lastBeaconTxMs >= beaconIntervalMs)) {
+    String packet = buildUnicastPacket(payload);
     LoRa.beginPacket();
-    LoRa.print(payload);
+    LoRa.print(packet);
     LoRa.endPacket();
     lastBeaconTxMs = now;
-    Serial.print("Beacon sent: ");
+    Serial.print("Beacon sent to ");
+    Serial.print(targetNodeId);
+    Serial.print(": ");
     Serial.println(payload);
   }
 
@@ -434,6 +916,8 @@ void setup() {
     Serial.println("OLED initialization failed");
   }
 
+  initSavedStorage();
+
   LoRa.setPins(SS, -1, -1);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa Error");
@@ -450,11 +934,14 @@ void setup() {
 
   current_mode = BEACON;
   enterState(UI_HOME);
+  sanitizeNodeIds();
+  showToast("Me:" + String(myNodeId) + " T:" + String(targetNodeId), 1300);
 }
 
 
 void loop() {
   processReceivedLoRa();
+  tickRxMarquee();
 
   int rotation = readEncoderDirection();
   handleEncoderRotate(rotation);
