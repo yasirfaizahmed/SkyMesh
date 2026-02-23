@@ -1,7 +1,6 @@
 #include <LoRa.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include <Keypad.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -42,14 +41,38 @@ const byte KEYPAD_COLS = 4;
 byte rowPins[KEYPAD_ROWS] = {0, 1, 2, 3};
 byte colPins[KEYPAD_COLS] = {6, 7, 8, 9};
 
-char keymap[KEYPAD_ROWS][KEYPAD_COLS] = {
-  {'1', '2', '3', 'A'},
-  {'4', '5', '6', 'B'},
-  {'7', '8', '9', 'C'},
-  {'*', '0', '#', 'D'}
+// Easy-to-edit keypad layout by physical button number (1..16):
+//  1  2  3  4
+//  5  6  7  8
+//  9 10 11 12
+// 13 14 15 16
+// Change only this array to remap any button quickly.
+const uint8_t KEYPAD_BUTTON_COUNT = 16;
+char keypadLayoutByButton[KEYPAD_BUTTON_COUNT] = {
+  '1', '2', '3', 'A',
+  '4', '5', '6', 'B',
+  '7', '8', '9', 'C',
+  '*', '0', '#', 'D'
 };
 
-Keypad keypad = Keypad(makeKeymap(keymap), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
+// Nokia-style multi-tap sets per physical button (same 1..16 order as above).
+// You can fully customize letters/symbols per button here.
+// Examples:
+//  - button 2 uses "abc2"  (press repeatedly: a->b->c->2)
+//  - button 7 uses "pqrs7" (includes 4 letters)
+const char* keypadMultiTapByButton[KEYPAD_BUTTON_COUNT] = {
+  // Rotated 90° clockwise from canonical 4x4 mapping
+  // 1,2,3,A
+  "*",     "pqrs7", "ghi4", ".,!?1",
+  // 4,5,6,B
+  " 0",    "tuv8",  "jkl5", "abc2",
+  // 7,8,9,C
+  "#",     "wxyz9", "mno6", "def3",
+  // *,0,#,D
+  "",      "",      "",     ""
+};
+
+char keymap[KEYPAD_ROWS][KEYPAD_COLS];
 
 // Modes
 #define BEACON "BEACON"
@@ -91,6 +114,7 @@ int menu_index = 0;
 int myNodeId = DEFAULT_MY_NODE_ID;
 int targetNodeId = 2;
 UiState uiState = UI_HOME;
+bool loraReady = false;
 
 // Multi-tap (2010 phone style) text input state
 char lastMultiTapKey = '\0';
@@ -140,6 +164,24 @@ unsigned long rxNextStepMs = 0;
 unsigned long rxPauseUntilMs = 0;
 const unsigned long rxScrollStepMs = 70;
 const unsigned long rxScrollPauseMs = 700;
+const unsigned long keypadDebounceMs = 25;
+
+// Key mapping adjusters (for keypad modules where line groups are swapped/reversed)
+// Your wiring uses: L1..L4 -> GP0..GP3, R1..R4 -> GP6..GP9
+// For your current keypad board, L/R groups behave swapped logically.
+// If you mount keypad with pins on TOP edge, rotate logical keys by 90.
+const bool KEYPAD_SWAP_LR_GROUPS = true;
+const bool KEYPAD_REVERSE_L_ORDER = false;
+const bool KEYPAD_REVERSE_R_ORDER = false;
+const int KEYPAD_ROTATION_DEG = 270;  // 90° anti-clockwise
+const bool KEYPAD_MIRROR_HORIZONTAL = true; // flip left-to-right
+const bool KEYPAD_MIRROR_VERTICAL = false;
+
+// Custom keypad scan state
+char lastRawMatrixKey = '\0';
+char lastStableMatrixKey = '\0';
+bool matrixKeyHeld = false;
+unsigned long matrixLastChangeMs = 0;
 
 
 bool initilialize_OLED() {
@@ -159,26 +201,197 @@ bool initilialize_OLED() {
 }
 
 
-void powerOnAnimation() {
-  String message = "SkyMesh";
-  int16_t x1, y1;
-  uint16_t width, height;
+char layoutCharForButton(uint8_t buttonOneBased) {
+  if (buttonOneBased < 1 || buttonOneBased > KEYPAD_BUTTON_COUNT) {
+    return '\0';
+  }
+  return keypadLayoutByButton[buttonOneBased - 1];
+}
 
-  OLED.setTextSize(2);
-  OLED.setTextColor(WHITE);
-  OLED.getTextBounds(message, 0, 0, &x1, &y1, &width, &height);
 
-  int offset = 30;
-  int start_y = SCREEN_HEIGHT + offset;
-  for (int y = start_y; y > (SCREEN_HEIGHT / 2) - (height / 2); y--) {
-    OLED.clearDisplay();
-    OLED.setCursor((SCREEN_WIDTH - width) / 2, y);
-    OLED.print(message);
-    OLED.display();
-    delay(10);
+void rebuildKeymapFromLayout() {
+  for (uint8_t r = 0; r < KEYPAD_ROWS; r++) {
+    for (uint8_t c = 0; c < KEYPAD_COLS; c++) {
+      uint8_t buttonNum = (r * KEYPAD_COLS) + c + 1; // 1..16
+      keymap[r][c] = layoutCharForButton(buttonNum);
+    }
+  }
+}
+
+
+void initMatrixKeypad() {
+  // Rows are actively driven; keep idle HIGH.
+  for (int r = 0; r < KEYPAD_ROWS; r++) {
+    pinMode(rowPins[r], OUTPUT);
+    digitalWrite(rowPins[r], HIGH);
   }
 
-  delay(500);
+  // Columns are read with pull-ups.
+  for (int c = 0; c < KEYPAD_COLS; c++) {
+    pinMode(colPins[c], INPUT_PULLUP);
+  }
+}
+
+
+char mapKeyFromScan(int lIndex, int rIndex) {
+  int row = lIndex;
+  int col = rIndex;
+
+  // Optionally reverse physical line orders.
+  if (KEYPAD_REVERSE_L_ORDER) row = (KEYPAD_ROWS - 1) - row;
+  if (KEYPAD_REVERSE_R_ORDER) col = (KEYPAD_COLS - 1) - col;
+
+  // If L/R groups are logically swapped on a module, transpose lookup.
+  if (KEYPAD_SWAP_LR_GROUPS) {
+    int t = row;
+    row = col;
+    col = t;
+  }
+
+  // Apply visual keypad orientation.
+  int mappedRow = row;
+  int mappedCol = col;
+
+  if (KEYPAD_ROTATION_DEG == 90) {
+    mappedRow = col;
+    mappedCol = (KEYPAD_COLS - 1) - row;
+  } else if (KEYPAD_ROTATION_DEG == 180) {
+    mappedRow = (KEYPAD_ROWS - 1) - row;
+    mappedCol = (KEYPAD_COLS - 1) - col;
+  } else if (KEYPAD_ROTATION_DEG == 270) {
+    mappedRow = (KEYPAD_ROWS - 1) - col;
+    mappedCol = row;
+  }
+
+  if (KEYPAD_MIRROR_HORIZONTAL) {
+    mappedCol = (KEYPAD_COLS - 1) - mappedCol;
+  }
+  if (KEYPAD_MIRROR_VERTICAL) {
+    mappedRow = (KEYPAD_ROWS - 1) - mappedRow;
+  }
+
+  return keymap[mappedRow][mappedCol];
+}
+
+
+char readRawMatrixKey() {
+  for (int r = 0; r < KEYPAD_ROWS; r++) {
+    // Set all rows HIGH, then pull one LOW to scan it.
+    for (int i = 0; i < KEYPAD_ROWS; i++) {
+      digitalWrite(rowPins[i], HIGH);
+    }
+    digitalWrite(rowPins[r], LOW);
+    delayMicroseconds(30);
+
+    for (int c = 0; c < KEYPAD_COLS; c++) {
+      if (digitalRead(colPins[c]) == LOW) {
+        // Restore idle state before returning.
+        digitalWrite(rowPins[r], HIGH);
+        return mapKeyFromScan(r, c);
+      }
+    }
+
+    digitalWrite(rowPins[r], HIGH);
+  }
+
+  return '\0';
+}
+
+
+char getMatrixKeyDebounced() {
+  unsigned long now = millis();
+  char raw = readRawMatrixKey();
+
+  if (raw != lastRawMatrixKey) {
+    lastRawMatrixKey = raw;
+    matrixLastChangeMs = now;
+  }
+
+  if (now - matrixLastChangeMs < keypadDebounceMs) {
+    return '\0';
+  }
+
+  if (lastStableMatrixKey != lastRawMatrixKey) {
+    lastStableMatrixKey = lastRawMatrixKey;
+
+    // Key released: re-arm for next press.
+    if (lastStableMatrixKey == '\0') {
+      matrixKeyHeld = false;
+      return '\0';
+    }
+
+    // New stable press: emit once.
+    if (!matrixKeyHeld) {
+      matrixKeyHeld = true;
+      return lastStableMatrixKey;
+    }
+  }
+
+  return '\0';
+}
+
+
+void powerOnAnimation() {
+  const String brand = "SkyMesh";
+  const String subtitle = "Pico Duplex";
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  // Phase 1: vertical logo slide-in
+  OLED.setTextColor(WHITE);
+  OLED.setTextSize(2);
+  OLED.getTextBounds(brand, 0, 0, &x1, &y1, &w, &h);
+  int logoX = (SCREEN_WIDTH - w) / 2;
+  int logoTargetY = 12;
+
+  for (int y = SCREEN_HEIGHT + 20; y >= logoTargetY; y -= 2) {
+    OLED.clearDisplay();
+    OLED.setCursor(logoX, y);
+    OLED.print(brand);
+    OLED.display();
+    delay(12);
+  }
+
+  // Phase 2: subtitle fade-in effect (line by line reveal)
+  OLED.setTextSize(1);
+  OLED.getTextBounds(subtitle, 0, 0, &x1, &y1, &w, &h);
+  int subX = (SCREEN_WIDTH - w) / 2;
+  int subY = 36;
+
+  for (int i = 1; i <= (int)subtitle.length(); i++) {
+    OLED.clearDisplay();
+    OLED.setTextSize(2);
+    OLED.setCursor(logoX, logoTargetY);
+    OLED.print(brand);
+    OLED.setTextSize(1);
+    OLED.setCursor(subX, subY);
+    OLED.print(subtitle.substring(0, i));
+    OLED.display();
+    delay(45);
+  }
+
+  // Phase 3: loading bar fill
+  int barX = 14;
+  int barY = 52;
+  int barW = SCREEN_WIDTH - 28;
+  int barH = 8;
+
+  for (int fill = 0; fill <= barW - 2; fill += 3) {
+    OLED.clearDisplay();
+    OLED.setTextSize(2);
+    OLED.setCursor(logoX, logoTargetY);
+    OLED.print(brand);
+    OLED.setTextSize(1);
+    OLED.setCursor(subX, subY);
+    OLED.print(subtitle);
+
+    OLED.drawRoundRect(barX, barY, barW, barH, 2, WHITE);
+    OLED.fillRect(barX + 1, barY + 1, fill, barH - 2, WHITE);
+    OLED.display();
+    delay(20);
+  }
+
+  delay(350);
   OLED.clearDisplay();
   OLED.display();
 }
@@ -700,6 +913,8 @@ bool parseUnicastPacket(const String &packet, int &to, int &from, String &messag
 
 
 void processReceivedLoRa() {
+  if (!loraReady) return;
+
   int packetSize = LoRa.parsePacket();
   if (!packetSize) return;
 
@@ -729,18 +944,13 @@ void processReceivedLoRa() {
 
 
 const char* getMultiTapSet(char key) {
-  switch (key) {
-    case '1': return " .,!?1";
-    case '2': return "abc2";
-    case '3': return "def3";
-    case '4': return "ghi4";
-    case '5': return "jkl5";
-    case '6': return "mno6";
-    case '7': return "pqrs7";
-    case '8': return "tuv8";
-    case '9': return "wxyz9";
-    default: return nullptr;
+  for (uint8_t i = 0; i < KEYPAD_BUTTON_COUNT; i++) {
+    if (keypadLayoutByButton[i] == key) {
+      return keypadMultiTapByButton[i];
+    }
   }
+
+  return nullptr;
 }
 
 
@@ -811,6 +1021,9 @@ void executeMenuAction() {
   else if (selected == "SEND") {
     if (payload.length() == 0) {
       showToast("Payload empty");
+      enterState(UI_HOME);
+    } else if (!loraReady) {
+      showToast("LoRa not detected");
       enterState(UI_HOME);
     } else if (targetNodeId == myNodeId) {
       showToast("Target cannot be self");
@@ -936,35 +1149,47 @@ void tickMultiTapTimeout() {
 void handleActionKey(char key) {
   commitPendingMultiTap();
 
-  if (key == 'A') {
-    enterState(UI_HOME);
-    showToast("Home", 600);
-  } else if (key == 'B') {
-    handleDoubleClick();
+  if (key == 'B') {
+    // Requested: B does nothing.
+    return;
   } else if (key == 'C') {
-    if (uiState == UI_BEACON) {
+    // Requested: C does nothing.
+    return;
+  }
+
+  if (key == 'A') {
+    // Requested mapping:
+    // - Home: A deletes last char
+    // - Menu / menu-related screens: A acts as back
+    if (uiState == UI_HOME) {
+      if (payload.length() > 0) {
+        payload.remove(payload.length() - 1);
+        showToast("Deleted last char", 700);
+      } else {
+        showToast("Payload is empty", 700);
+      }
+      uiDirty = true;
+    } else if (uiState == UI_MENU) {
       enterState(UI_HOME);
-      showToast("Beacon stopped", 700);
+      showToast("Back", 600);
     } else {
-      enterState(UI_HOME);
-      showToast("Exit", 600);
+      enterState(UI_MENU);
+      showToast("Back", 600);
     }
   } else if (key == 'D') {
-    if (uiState == UI_HOME) {
-      enterState(UI_MENU);
-    } else {
-      enterState(UI_HOME);
-    }
+    // Requested mapping: D opens menu.
+    enterState(UI_MENU);
+    showToast("Menu", 600);
   }
 }
 
 
 void handleNavigationKey(char key) {
-  // Nav buttons requested by user: 2,5,7,10 (top-left counting)
-  // -> key chars: '2', '4', '6', '8'
-  if (key == '2' || key == '4') {
+  // Requested menu navigation keys: g/m for navigation.
+  // Keep numeric/nav aliases for compatibility with existing keypad mapping.
+  if (key == '2' || key == '4' || key == 'a' || key == 'g') {
     handleEncoderRotate(-1);
-  } else if (key == '6' || key == '8') {
+  } else if (key == '6' || key == '8' || key == 'm' || key == 't') {
     handleEncoderRotate(1);
   }
 }
@@ -973,15 +1198,11 @@ void handleNavigationKey(char key) {
 void handleKeypadInput(char key) {
   if (!key) return;
 
-  // 4/8/12/16 buttons (A/B/C/D) for home/back/exit/menu actions
-  if (key == 'A' || key == 'B' || key == 'C' || key == 'D') {
-    handleActionKey(key);
-    return;
-  }
-
   if (uiState == UI_HOME) {
-    // 2010-style multi-tap text entry on 1..9
-    if (key >= '1' && key <= '9') {
+    // In current rotated layout, letters/punctuation can also be on A/B/C/D.
+    // So for HOME typing, accept any key that has a non-empty multi-tap set.
+    const char* set = getMultiTapSet(key);
+    if (set != nullptr && strlen(set) > 0) {
       handleMultiTapKey(key);
       return;
     }
@@ -1007,8 +1228,14 @@ void handleKeypadInput(char key) {
     return;
   }
 
-  // Non-home screens: nav + OK
-  if (key == '5') { // button 6 as OK
+  // Non-home screens keep action-key handling.
+  if (key == 'A' || key == 'B' || key == 'C' || key == 'D') {
+    handleActionKey(key);
+    return;
+  }
+
+  // Non-home screens: nav + OK (j / key 5).
+  if (key == '5' || key == 'j') {
     handleSingleClick();
     return;
   }
@@ -1018,7 +1245,7 @@ void handleKeypadInput(char key) {
 
 
 void runBeaconTick() {
-  if (uiState != UI_BEACON) return;
+  if (uiState != UI_BEACON || !loraReady) return;
 
   unsigned long now = millis();
 
@@ -1053,21 +1280,31 @@ void setup() {
     Serial.println("OLED initialization failed");
   }
 
+  rebuildKeymapFromLayout();
+  initMatrixKeypad();
+
+  // Always show intro on OLED, even when other modules are not connected.
+  powerOnAnimation();
+
   initSavedStorage();
 
   LoRa.setPins(SS, RST, DIO0);
-  if (!LoRa.begin(433E6)) {
-    Serial.println("LoRa Error");
-    delay(100);
-    for (;;);
+  if (LoRa.begin(433E6)) {
+    loraReady = true;
+    Serial.println("LoRa OK");
+  } else {
+    loraReady = false;
+    Serial.println("LoRa not detected - running OLED/UI only");
   }
-
-  powerOnAnimation();
 
   current_mode = BEACON;
   enterState(UI_HOME);
   sanitizeNodeIds();
-  showToast("Me:" + String(myNodeId) + " T:" + String(targetNodeId), 1300);
+  if (loraReady) {
+    showToast("Me:" + String(myNodeId) + " T:" + String(targetNodeId), 1300);
+  } else {
+    showToast("OLED mode (LoRa off)", 1300);
+  }
 }
 
 
@@ -1075,7 +1312,7 @@ void loop() {
   processReceivedLoRa();
   tickRxMarquee();
 
-  char key = keypad.getKey();
+  char key = getMatrixKeyDebounced();
   if (key) {
     handleKeypadInput(key);
   }
