@@ -31,11 +31,11 @@
 //  5  6  7  8
 //  9 10 11 12
 // 13 14 15 16
-// Key chars used here:
-//  1 2 3 A
-//  4 5 6 B
-//  7 8 9 C
-//  * 0 # D
+// Key chars used here (layout rotated 90° clockwise):
+//  * 7 4 1
+//  0 8 5 2
+//  # 9 6 3
+//  D C B A
 const byte KEYPAD_ROWS = 4;
 const byte KEYPAD_COLS = 4;
 byte rowPins[KEYPAD_ROWS] = {0, 1, 2, 3};
@@ -49,10 +49,10 @@ byte colPins[KEYPAD_COLS] = {6, 7, 8, 9};
 // Change only this array to remap any button quickly.
 const uint8_t KEYPAD_BUTTON_COUNT = 16;
 char keypadLayoutByButton[KEYPAD_BUTTON_COUNT] = {
-  '1', '2', '3', 'A',
-  '4', '5', '6', 'B',
-  '7', '8', '9', 'C',
-  '*', '0', '#', 'D'
+  '*', '7', '4', '1',
+  '0', '8', '5', '2',
+  '#', '9', '6', '3',
+  'D', 'C', 'B', 'A'
 };
 
 // Nokia-style multi-tap sets per physical button (same 1..16 order as above).
@@ -83,7 +83,7 @@ const int NODE_ID_MIN = 1;
 const int NODE_ID_MAX = 9;
 
 // Menu
-String menu[] = {"Delete", "Clear", "Save", "Saved", "SelfID", "Target", "SEND", "Back"};
+String menu[] = {"Save", "Saved", "SelfID", "Target", "SEND"};
 const int menu_size = sizeof(menu) / sizeof(menu[0]);
 
 // Character table
@@ -165,6 +165,7 @@ unsigned long rxPauseUntilMs = 0;
 const unsigned long rxScrollStepMs = 70;
 const unsigned long rxScrollPauseMs = 700;
 const unsigned long keypadDebounceMs = 25;
+const unsigned long aLongPressMs = 800;
 
 // Key mapping adjusters (for keypad modules where line groups are swapped/reversed)
 // Your wiring uses: L1..L4 -> GP0..GP3, R1..R4 -> GP6..GP9
@@ -182,6 +183,18 @@ char lastRawMatrixKey = '\0';
 char lastStableMatrixKey = '\0';
 bool matrixKeyHeld = false;
 unsigned long matrixLastChangeMs = 0;
+
+// A-key press handling (short: delete last char, long: clear payload)
+bool aPressTracking = false;
+bool aLongPressHandled = false;
+unsigned long aPressStartMs = 0;
+
+enum APressMode {
+  A_PRESS_NONE,
+  A_PRESS_HOME_EDIT,
+  A_PRESS_SAVED_SELECT
+};
+APressMode aPressMode = A_PRESS_NONE;
 
 
 bool initilialize_OLED() {
@@ -568,6 +581,49 @@ bool savePayloadToEEPROM() {
 }
 
 
+bool deleteSavedMessageByDisplayIndex(int displayIndex) {
+  if (savedCount <= 0 || displayIndex < 0 || displayIndex >= savedCount) {
+    return false;
+  }
+
+  String kept[MAX_SAVED_MESSAGES];
+  int keepCount = 0;
+
+  for (int i = 0; i < savedCount; i++) {
+    if (i == displayIndex) continue;
+    kept[keepCount++] = getSavedMessageByIndex(i);
+  }
+
+  // Clear all slots first.
+  for (int s = 0; s < MAX_SAVED_MESSAGES; s++) {
+    clearMessageSlot(s);
+  }
+
+  if (keepCount == 0) {
+    savedCount = 0;
+    savedHead = -1;
+    EEPROM.write(EEPROM_ADDR_COUNT, 0);
+    EEPROM.write(EEPROM_ADDR_HEAD, 255);
+    EEPROM.commit();
+    return true;
+  }
+
+  // Rebuild as linear oldest->latest in slots [0..keepCount-1]
+  // while kept[] is latest->oldest.
+  for (int slot = 0; slot < keepCount; slot++) {
+    int srcIndex = (keepCount - 1) - slot;
+    writeMessageSlot(slot, kept[srcIndex]);
+  }
+
+  savedCount = keepCount;
+  savedHead = keepCount - 1;
+  EEPROM.write(EEPROM_ADDR_COUNT, savedCount);
+  EEPROM.write(EEPROM_ADDR_HEAD, savedHead);
+  EEPROM.commit();
+  return true;
+}
+
+
 int getSlotByDisplayIndex(int displayIndex) {
   if (savedCount == 0 || displayIndex < 0 || displayIndex >= savedCount || savedHead < 0) {
     return -1;
@@ -697,15 +753,17 @@ void drawRxMarqueeArea() {
 void drawHomeScreen() {
   drawHeader();
 
-  // Multi-tap compose preview (same size as payload text)
-  OLED.setTextSize(1);
-  OLED.setCursor(4, 28);
-  OLED.print(composePreview);
+  // Payload text (2 rows). Show active multi-tap preview inline at insertion point,
+  // like classic keypad phones.
+  String inlinePayload = payload;
+  if (multiTapActive) {
+    inlinePayload += composePreview;
+  }
 
-  // Payload text (2 rows, no outline borders)
-  const int perRowChars = 18;
+  // Wider rows now that preview is inlined (no separate preview area).
+  const int perRowChars = 21;
   const int totalVisibleChars = perRowChars * 2;
-  String visiblePayload = getTailWindow(payload, totalVisibleChars);
+  String visiblePayload = getTailWindow(inlinePayload, totalVisibleChars);
 
   String row1 = "";
   String row2 = "";
@@ -717,9 +775,9 @@ void drawHomeScreen() {
   }
 
   OLED.setTextSize(1);
-  OLED.setCursor(18, 22);
+  OLED.setCursor(0, 22);
   OLED.print(row1);
-  OLED.setCursor(18, 32);
+  OLED.setCursor(0, 32);
   OLED.print(row2);
 
   // RX message area (marquee when long)
@@ -987,21 +1045,7 @@ void commitPendingMultiTap() {
 void executeMenuAction() {
   String selected = menu[menu_index];
 
-  if (selected == "Delete") {
-    if (payload.length() > 0) {
-      payload.remove(payload.length() - 1);
-      showToast("Deleted last char");
-    } else {
-      showToast("Payload is empty");
-    }
-    enterState(UI_HOME);
-  }
-  else if (selected == "Clear") {
-    payload = "";
-    showToast("Payload cleared");
-    enterState(UI_HOME);
-  }
-  else if (selected == "Save") {
+  if (selected == "Save") {
     if (savePayloadToEEPROM()) {
       showToast("Saved message");
     } else {
@@ -1032,9 +1076,6 @@ void executeMenuAction() {
       enterState(UI_BEACON);
       showToast("Beacon started", 700);
     }
-  }
-  else if (selected == "Back") {
-    enterState(UI_HOME);
   }
 }
 
@@ -1146,29 +1187,127 @@ void tickMultiTapTimeout() {
 }
 
 
+void beginAPressTracking(APressMode mode) {
+  aPressTracking = true;
+  aLongPressHandled = false;
+  aPressStartMs = millis();
+  aPressMode = mode;
+}
+
+
+void resetAPressTracking() {
+  aPressTracking = false;
+  aLongPressHandled = false;
+  aPressStartMs = 0;
+  aPressMode = A_PRESS_NONE;
+}
+
+
+void doDeleteLastChar() {
+  commitPendingMultiTap();
+  if (payload.length() > 0) {
+    payload.remove(payload.length() - 1);
+    showToast("Deleted last char", 700);
+  } else {
+    showToast("Payload is empty", 700);
+  }
+  uiDirty = true;
+}
+
+
+void doClearPayload() {
+  commitPendingMultiTap();
+  if (payload.length() > 0) {
+    payload = "";
+    showToast("Payload cleared", 700);
+  } else {
+    showToast("Payload is empty", 700);
+  }
+  uiDirty = true;
+}
+
+
+void doBackFromSaved() {
+  enterState(UI_MENU);
+  showToast("Back", 600);
+}
+
+
+void doDeleteSelectedSavedMessage() {
+  if (savedCount <= 0) {
+    showToast("No saved messages", 700);
+    return;
+  }
+
+  if (deleteSavedMessageByDisplayIndex(savedBrowseIndex)) {
+    if (savedCount == 0) {
+      savedBrowseIndex = 0;
+      showToast("Saved msg deleted", 700);
+      enterState(UI_MENU);
+    } else {
+      if (savedBrowseIndex >= savedCount) {
+        savedBrowseIndex = savedCount - 1;
+      }
+      showToast("Saved msg deleted", 700);
+      uiDirty = true;
+    }
+  } else {
+    showToast("Delete failed", 700);
+  }
+}
+
+
+void tickAPressActions() {
+  if (!aPressTracking) return;
+
+  bool isAHeld = (lastStableMatrixKey == 'A' && matrixKeyHeld);
+  unsigned long now = millis();
+
+  if (isAHeld) {
+    if (!aLongPressHandled && (now - aPressStartMs >= aLongPressMs)) {
+      if (aPressMode == A_PRESS_HOME_EDIT) {
+        doClearPayload();
+      } else if (aPressMode == A_PRESS_SAVED_SELECT) {
+        doDeleteSelectedSavedMessage();
+      }
+      aLongPressHandled = true;
+    }
+    return;
+  }
+
+  // A was released (or changed key).
+  if (!aLongPressHandled) {
+    if (aPressMode == A_PRESS_HOME_EDIT) {
+      doDeleteLastChar();
+    } else if (aPressMode == A_PRESS_SAVED_SELECT) {
+      doBackFromSaved();
+    }
+  }
+
+  resetAPressTracking();
+}
+
+
 void handleActionKey(char key) {
   commitPendingMultiTap();
 
   if (key == 'B') {
-    // Requested: B does nothing.
+    // Requested: B not set for now.
     return;
   } else if (key == 'C') {
-    // Requested: C does nothing.
+    // Requested: C not set for now.
     return;
   }
 
   if (key == 'A') {
     // Requested mapping:
-    // - Home: A deletes last char
+    // - Home: A short-press deletes last char, long-press clears payload
     // - Menu / menu-related screens: A acts as back
     if (uiState == UI_HOME) {
-      if (payload.length() > 0) {
-        payload.remove(payload.length() - 1);
-        showToast("Deleted last char", 700);
-      } else {
-        showToast("Payload is empty", 700);
-      }
-      uiDirty = true;
+      beginAPressTracking(A_PRESS_HOME_EDIT);
+    } else if (uiState == UI_SAVED) {
+      // Saved list: short A = back, long A = delete selected saved message.
+      beginAPressTracking(A_PRESS_SAVED_SELECT);
     } else if (uiState == UI_MENU) {
       enterState(UI_HOME);
       showToast("Back", 600);
@@ -1185,11 +1324,20 @@ void handleActionKey(char key) {
 
 
 void handleNavigationKey(char key) {
-  // Requested menu navigation keys: g/m for navigation.
-  // Keep numeric/nav aliases for compatibility with existing keypad mapping.
-  if (key == '2' || key == '4' || key == 'a' || key == 'g') {
+  if (uiState == UI_SAVED) {
+    // Saved list is vertical: use only 2/8 for up/down.
+    if (key == '2') {
+      handleEncoderRotate(-1);
+    } else if (key == '8') {
+      handleEncoderRotate(1);
+    }
+    return;
+  }
+
+  // Menu navigation keys: only 4 (left/up) and 6 (right/down), plus g/m aliases.
+  if (key == '4' || key == 'a' || key == 'g') {
     handleEncoderRotate(-1);
-  } else if (key == '6' || key == '8' || key == 'm' || key == 't') {
+  } else if (key == '6' || key == 'm' || key == 't') {
     handleEncoderRotate(1);
   }
 }
@@ -1199,6 +1347,12 @@ void handleKeypadInput(char key) {
   if (!key) return;
 
   if (uiState == UI_HOME) {
+    // Dedicated action keys in HOME.
+    if (key == 'A' || key == 'B' || key == 'C' || key == 'D') {
+      handleActionKey(key);
+      return;
+    }
+
     // In current rotated layout, letters/punctuation can also be on A/B/C/D.
     // So for HOME typing, accept any key that has a non-empty multi-tap set.
     const char* set = getMultiTapSet(key);
@@ -1316,6 +1470,7 @@ void loop() {
   if (key) {
     handleKeypadInput(key);
   }
+  tickAPressActions();
   tickMultiTapTimeout();
 
   runBeaconTick();
